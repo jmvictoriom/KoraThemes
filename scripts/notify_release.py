@@ -16,6 +16,11 @@ from pathlib import Path
 
 REPOSITORY = "jmvictoriom/KoraThemes"
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+RECIPIENT_POLICY_MARKER = "<!-- kora-release-recipients:v1 -->"
+EMAIL = re.compile(
+    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+)
 
 
 class NotificationError(Exception):
@@ -23,18 +28,20 @@ class NotificationError(Exception):
 
 
 def addresses(value):
-    if "\r" in value or "\n" in value:
+    if not isinstance(value, str) or "\r" in value or "\n" in value:
         raise NotificationError("Email addresses must not contain line breaks.")
-    result = [item.strip() for item in value.split(",")]
+    result = [item.strip().lower() for item in value.split(",")]
     if not result or any(
-        re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", item) is None
+        not item.isascii() or len(item) > 254 or EMAIL.fullmatch(item) is None
+        or len(item.split("@", 1)[0]) > 64 or item.startswith(".")
+        or item.split("@", 1)[0].endswith(".") or ".." in item.split("@", 1)[0]
         for item in result
     ):
         raise NotificationError("Configure valid, comma-separated email addresses.")
     return list(dict.fromkeys(result))
 
 
-def release_message(event, sender, recipients):
+def release_details(event):
     repository = event.get("repository") if isinstance(event, dict) else None
     if not isinstance(repository, dict) or repository.get("full_name") != REPOSITORY:
         raise NotificationError("The event does not belong to KoraThemes.")
@@ -76,6 +83,12 @@ def release_message(event, sender, recipients):
         ):
             raise NotificationError("An asset is incomplete or its download URL has the wrong version.")
         downloads.append(f"- {name}: {download}")
+    return release, prefix, downloads
+
+
+def release_message(event, sender, recipients):
+    release, prefix, downloads = release_details(event)
+    tag, url, changelog = release["tag_name"], release["html_url"], release["body"]
     message = EmailMessage()
     message["Subject"] = f"KoraThemes {tag} - {prefix}"
     message["From"] = sender
@@ -88,6 +101,47 @@ def release_message(event, sender, recipients):
         + f"\n\nChangelog:\n\n{changelog.strip()}\n"
     )
     return message
+
+
+def recipients_for_release(release, env):
+    release_id = release.get("id")
+    if type(release_id) is not int or release_id <= 0:
+        raise NotificationError("A valid release ID is required to select recipients.")
+    raw = env.get("RELEASE_EMAIL_SETTINGS")
+    try:
+        variables = {} if raw is None else json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise NotificationError("Release recipient settings are not valid JSON.") from error
+    if not isinstance(variables, dict):
+        raise NotificationError("Release recipient settings must be a JSON object.")
+    name = f"RELEASE_EMAIL_TO_{release_id}"
+    if name in variables:
+        try:
+            selection = json.loads(variables[name])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise NotificationError("This release's recipient selection is not valid JSON.") from error
+        if (
+            not isinstance(selection, dict) or set(selection) != {"schema", "tag", "recipients"}
+            or type(selection["schema"]) is not int or selection["schema"] != 1
+            or selection["tag"] != release["tag_name"] or not isinstance(selection["recipients"], list)
+            or any(not isinstance(item, str) for item in selection["recipients"])
+        ):
+            raise NotificationError("The saved recipient selection does not match this release.")
+        if not selection["recipients"]:
+            return []
+        # Validate each entry separately: an entry must not hide additional addresses.
+        result = []
+        for item in selection["recipients"]:
+            if "," in item:
+                raise NotificationError("Each selected recipient must be one email address.")
+            parsed = addresses(item)
+            if len(parsed) != 1:
+                raise NotificationError("Each selected recipient must be one email address.")
+            result.extend(parsed)
+        return list(dict.fromkeys(result))
+    if RECIPIENT_POLICY_MARKER in release.get("body", ""):
+        raise NotificationError("This release's saved recipient selection is missing; no fallback email was sent.")
+    return addresses(variables.get("RELEASE_EMAIL_TO", env.get("RELEASE_EMAIL_TO", "")))
 
 
 @dataclass(frozen=True)
@@ -120,7 +174,12 @@ class SMTPSettings:
 
 
 def send_notification(event, env):
-    settings = SMTPSettings.load(env)
+    release, _, _ = release_details(event)
+    recipients = recipients_for_release(release, env)
+    if not recipients:
+        print("No recipients selected for this release; email intentionally skipped.")
+        return
+    settings = SMTPSettings.load(dict(env, RELEASE_EMAIL_TO=",".join(recipients)))
     message = release_message(event, settings.sender, settings.recipients)
     context = ssl.create_default_context()
     if settings.security == "ssl":
